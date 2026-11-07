@@ -4,9 +4,11 @@
  *  - Registers as Audio/Sink so it appears in output device selectors
  *  - Connects to the AriaCast server only when streaming starts
  *    (user routes audio here), disconnects when stopped/idle
- *  - MPRIS2 DBus listener for metadata: xesam:title, xesam:artist,
- *    xesam:album, mpris:artUrl. mpris:trackid is used to detect track
- *    changes and clear stale album/artwork.
+ *  - MPRIS2 DBus integration: metadata (xesam:title, xesam:artist,
+ *    xesam:album, mpris:artUrl, mpris:length), playback state and
+ *    position of the active player; /control commands from the
+ *    receiver (play/pause/toggle/stop/next/previous/seek) are
+ *    forwarded to that player.
  *
  * Threading rules (this code runs inside the PipeWire daemon):
  *  - on_process() runs on the RT data thread and must never block:
@@ -23,6 +25,7 @@
 
 #define _GNU_SOURCE
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <dbus/dbus.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -32,12 +35,14 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <sys/random.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -60,6 +65,7 @@ PW_LOG_TOPIC_STATIC(mod_topic, "mod." MODULE_NAME);
 #define KEY_NAME      "ariacast.sink.name"
 #define KEY_DESC      "ariacast.sink.description"
 #define KEY_DISCOVERY "ariacast.discovery.enabled"
+#define KEY_KEEPALIVE "ariacast.pause.keepalive"   /* seconds, 0 = off */
 
 /* ── Protocol constants ─────────────────────────────────────────── */
 #define AC_RATE         48000
@@ -74,7 +80,11 @@ PW_LOG_TOPIC_STATIC(mod_topic, "mod." MODULE_NAME);
 #define AC_BO_MAX       5           /* cap at 2^5 = 32 s            */
 #define AC_IDLE_MS      3000        /* disconnect after 3 s silence */
 #define AC_REDISCOVER_EVERY 3       /* re-discover every N failed reconnects */
+#define AC_PAUSE_KEEPALIVE_S 600    /* stay connected while paused  */
 #define AC_META_EVERY_MS 10000      /* metadata refresh interval    */
+#define AC_META_PLAYING_MS 1000     /* ... while playing (position) */
+#define MPRIS_POS_POLL_MS  5000     /* re-read Position from player */
+#define MPRIS_CMD_MAX      8        /* queued /control commands     */
 #define WS_MAX_FRAME    (64*1024)   /* largest frame accepted from the server */
 #define META_JSON_MAX   12288       /* fits all fields fully JSON-escaped (×6) */
 
@@ -491,20 +501,47 @@ static void conn_set(conn_t *c, int f) {
 /* ═══════════════════════════════════════════════════════════════════
  * Metadata state
  * ═══════════════════════════════════════════════════════════════════ */
+/* PlaybackStatus of the active MPRIS player */
+enum { MPRIS_STATE_UNKNOWN, MPRIS_STATE_PLAYING, MPRIS_STATE_PAUSED, MPRIS_STATE_STOPPED };
+
 typedef struct {
     char    title[256], artist[256], album[256], artwork[512];
     char    last_trackid[256]; /* mpris:trackid of the last processed update */
     bool    title_placeholder; /* title is the sink name, not from MPRIS     */
-    int64_t dur_ms, pos_ms;
-    bool    playing;
+    int64_t dur_ms;            /* mpris:length, 0 = unknown                  */
+    int64_t pos_ms;            /* player position at pos_at_ms ...           */
+    uint64_t pos_at_ms;        /* ... (CLOCK_MONOTONIC); extrapolated while
+                                *  playing, see meta_pos_locked()            */
+    double  rate;              /* MPRIS Rate (playback speed)                */
+    int     state;             /* MPRIS_STATE_*                              */
+    bool    playing;           /* connected and streaming to the receiver    */
+    bool    playing_reported;  /* receiver acknowledged reported_playing ... */
+    bool    reported_playing;  /* ... since the last (re)connect             */
     bool    dirty;             /* thr_meta should POST as soon as possible   */
     pthread_mutex_t lock;
     pthread_cond_t  cond;
 } meta_t;
 
 static void meta_init(meta_t *m) {
+    m->rate = 1.0;
     pthread_mutex_init(&m->lock,NULL);
     pthread_cond_init(&m->cond,NULL);
+}
+/* Current position: last reported one plus elapsed time × rate. */
+static int64_t meta_pos_locked(const meta_t *m, uint64_t now) {
+    int64_t p = m->pos_ms;
+    if (m->state == MPRIS_STATE_PLAYING && m->pos_at_ms)
+        p += (int64_t)((double)(now - m->pos_at_ms) * m->rate);
+    if (p < 0) p = 0;
+    if (m->dur_ms > 0 && p > m->dur_ms) p = m->dur_ms;
+    return p;
+}
+static void meta_set_pos_locked(meta_t *m, int64_t pos_ms, uint64_t now) {
+    m->pos_ms = pos_ms; m->pos_at_ms = now;
+}
+/* isPlaying: streaming, unless the player says it is paused/stopped */
+static bool meta_is_playing_locked(const meta_t *m) {
+    return m->playing && m->state != MPRIS_STATE_PAUSED && m->state != MPRIS_STATE_STOPPED;
 }
 static void meta_destroy(meta_t *m) {
     pthread_mutex_destroy(&m->lock);
@@ -516,31 +553,36 @@ static void meta_mark_dirty(meta_t *m) {
     pthread_mutex_unlock(&m->lock);
 }
 
-/* Returns the JSON length, or -1 if it did not fit. */
-static int meta_to_json(meta_t *m, char *buf, size_t sz) {
+/* Returns the JSON length, or -1 if it did not fit. isPlaying/is_playing
+ * are included only if playing is non-NULL – see post_meta_now().    */
+static int meta_to_json(meta_t *m, char *buf, size_t sz, const bool *playing) {
     char t[256*6], ar[256*6], al[256*6], aw[512*6];
     pthread_mutex_lock(&m->lock);
     json_escape(m->title,   t,  sizeof(t));
     json_escape(m->artist,  ar, sizeof(ar));
     json_escape(m->album,   al, sizeof(al));
     json_escape(m->artwork, aw, sizeof(aw));
-    int64_t dur = m->dur_ms, pos = m->pos_ms;
-    const char *p = m->playing ? "true" : "false";
+    int64_t dur = m->dur_ms, pos = meta_pos_locked(m, now_ms());
     pthread_mutex_unlock(&m->lock);
+    char pl[48] = "";
+    if (playing) {
+        const char *p = *playing ? "true" : "false";
+        snprintf(pl, sizeof(pl), ",\"isPlaying\":%s,\"is_playing\":%s", p, p);
+    }
     int n = snprintf(buf,sz,
         "{\"title\":\"%s\",\"artist\":\"%s\",\"album\":\"%s\","
         "\"artworkUrl\":\"%s\",\"artwork_url\":\"%s\","
         "\"durationMs\":%" PRId64 ",\"duration_ms\":%" PRId64 ","
-        "\"positionMs\":%" PRId64 ",\"position_ms\":%" PRId64 ","
-        "\"isPlaying\":%s,\"is_playing\":%s}",
-        t, ar, al, aw, aw, dur, dur, pos, pos, p, p);
+        "\"positionMs\":%" PRId64 ",\"position_ms\":%" PRId64 "%s}",
+        t, ar, al, aw, aw, dur, dur, pos, pos, pl);
     return (n < 0 || (size_t)n >= sz) ? -1 : n;
 }
 
 /* ═══════════════════════════════════════════════════════════════════
  * HTTP POST /metadata  (metadata.md)
  * ═══════════════════════════════════════════════════════════════════ */
-static void http_post_meta(const char *host, uint16_t port, const char *mj, size_t mlen) {
+/* Returns true if the receiver answered with a 2xx status. */
+static bool http_post_meta(const char *host, uint16_t port, const char *mj, size_t mlen) {
     static const char pre[] = "{\"data\":", post[] = "}";
     char hp[300]; fmt_hostport(hp, sizeof(hp), host, port);
     char hdr[512];
@@ -548,13 +590,13 @@ static void http_post_meta(const char *host, uint16_t port, const char *mj, size
         "POST /metadata HTTP/1.0\r\nHost: %s\r\n"
         "Content-Type: application/json\r\nContent-Length: %zu\r\n"
         "Connection: close\r\n\r\n", hp, sizeof(pre)-1 + mlen + sizeof(post)-1);
-    if (hl<0 || (size_t)hl>=sizeof(hdr)) return;
+    if (hl<0 || (size_t)hl>=sizeof(hdr)) return false;
     char ps[8]; snprintf(ps,sizeof(ps),"%u",port);
     struct addrinfo hi={.ai_family=AF_UNSPEC,.ai_socktype=SOCK_STREAM}, *res=NULL;
     int gai = getaddrinfo(host,ps,&hi,&res);
     if (gai!=0) {
         pw_log_warn("/metadata: getaddrinfo(%s) failed: %s", hp, gai_strerror(gai));
-        return;
+        return false;
     }
     int fd=-1;
     for (struct addrinfo *ai=res; ai; ai=ai->ai_next) {
@@ -568,23 +610,26 @@ static void http_post_meta(const char *host, uint16_t port, const char *mj, size
     freeaddrinfo(res);
     if (fd<0) {
         pw_log_warn("/metadata: connect to %s failed: %s", hp, strerror(errno));
-        return;
+        return false;
     }
     if (io_write(fd,hdr,(size_t)hl)<0 || io_write(fd,pre,sizeof(pre)-1)<0 ||
         io_write(fd,mj,mlen)<0        || io_write(fd,post,sizeof(post)-1)<0) {
         pw_log_warn("/metadata: write to %s failed: %s", hp, strerror(errno));
         close(fd);
-        return;
+        return false;
     }
+    bool ok = false;
     char rb[128]={0}; ssize_t u=read(fd,rb,sizeof(rb)-1);
     if (u>0) {
         rb[u]=0;
         char *eol=strchr(rb,'\r'); if(eol)*eol=0;
+        ok = strncmp(rb,"HTTP/",5)==0 && (eol=strchr(rb,' ')) && eol[1]=='2';
         pw_log_debug("/metadata POST %s -> %s", hp, rb);
     } else {
         pw_log_debug("/metadata POST %s -> (no response, %s)", hp, strerror(errno));
     }
     close(fd);
+    return ok;
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -673,7 +718,8 @@ struct data {
     char     sink_name[128];
     char     sink_desc[256];
     bool     discovery;
-    bool     name_user_set;    /* ariacast.sink.name was configured     */
+    uint32_t pause_keepalive_ms; /* idle limit while the player is paused */
+    bool     name_user_set;   /* ariacast.sink.name was configured     */
     bool     desc_user_set;    /* ariacast.sink.description configured  */
     pthread_mutex_t name_lock; /* guards sink_name/sink_desc            */
 
@@ -717,6 +763,14 @@ struct data {
     meta_t  meta;
     conn_t  audio_conn, ctrl_conn, stats_conn;
 
+    /* /control commands for the active MPRIS player: queued by
+     * thr_ctrl, executed by thr_mpris (which owns the DBus
+     * connection), woken via the cmd_fd eventfd.                    */
+    struct { char action[16]; int64_t pos_ms; } cmds[MPRIS_CMD_MAX];
+    int             n_cmds;
+    pthread_mutex_t cmd_lock;
+    int             cmd_fd;
+
     /* Frame accumulation buffer for the AriaCast 20ms/3840B protocol
      * frame size (RT thread only). PipeWire's audioconvert negotiates
      * the stream to AC_RATE/AC_CHANNELS/S16LE (see create_stream()),
@@ -735,38 +789,72 @@ static uint16_t get_server(struct data *d, char *host, size_t sz) {
     return p;
 }
 
+/* isPlaying is sent only when it differs from what the receiver last
+ * accepted (and once after every connect). Receivers act on it, not
+ * just display it: Music Assistant restarts playback on true and drops
+ * the AriaCast source on false. A periodic refresh repeating a stale
+ * "true" while the receiver is pausing would resume playback there.  */
 static void post_meta_now(struct data *d) {
     char host[256]; uint16_t port = get_server(d, host, sizeof(host));
+    pthread_mutex_lock(&d->meta.lock);
+    bool playing = meta_is_playing_locked(&d->meta);
+    bool with_playing = !d->meta.playing_reported || d->meta.reported_playing != playing;
+    pthread_mutex_unlock(&d->meta.lock);
+
     char mj[META_JSON_MAX];
-    int n = meta_to_json(&d->meta, mj, sizeof(mj));
+    int n = meta_to_json(&d->meta, mj, sizeof(mj), with_playing ? &playing : NULL);
     if (n < 0) { pw_log_warn("/metadata: JSON too large, not sent"); return; }
-    http_post_meta(host, port, mj, (size_t)n);
+    if (!http_post_meta(host, port, mj, (size_t)n) || !with_playing) return;
+
+    pthread_mutex_lock(&d->meta.lock);
+    d->meta.playing_reported = true;
+    d->meta.reported_playing = playing;
+    pthread_mutex_unlock(&d->meta.lock);
+    pw_log_debug("/metadata: reported isPlaying=%s", playing ? "true" : "false");
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * MPRIS2 metadata helpers
+ * MPRIS2 integration
  *
  * Only standard MPRIS2 keys are used:
  *   xesam:title    -> title
  *   xesam:artist   -> artist (first element of the array)
  *   xesam:album    -> album
  *   mpris:artUrl   -> artworkUrl
- *   mpris:trackid  -> used only to detect track changes, so album/
- *                     artwork can be cleared when a new track has
- *                     none of its own (no stale cover/album shown).
+ *   mpris:length   -> durationMs
+ *   mpris:trackid  -> used to detect track changes, so album/artwork
+ *                     can be cleared when a new track has none of its
+ *                     own (no stale cover/album shown), and as the
+ *                     target of SetPosition for seeks.
+ * Player properties:
+ *   PlaybackStatus -> isPlaying
+ *   Position/Rate  -> positionMs (extrapolated between updates; the
+ *                     player does not signal Position changes, so it is
+ *                     re-read every MPRIS_POS_POLL_MS and on Seeked)
  *
- * Only org.mpris.MediaPlayer2.Player signals are considered, and only
- * from the "active" player: the one that most recently reported
- * PlaybackStatus=Playing (or the first one seen, until then).
+ * Only org.mpris.MediaPlayer2.Player is considered, and only the
+ * "active" player: the one that most recently reported
+ * PlaybackStatus=Playing (or the first one seen, until then). /control
+ * commands from the receiver are forwarded to that player.
  *
  * Empty-string values are treated as "field not present", since some
  * players send empty strings for fields they have cleared.
  * ═══════════════════════════════════════════════════════════════════ */
-#define MPRIS_IFACE "org.mpris.MediaPlayer2.Player"
-#define MPRIS_PATH  "/org/mpris/MediaPlayer2"
-#define MPRIS_MATCH \
-    "type='signal',interface='org.freedesktop.DBus.Properties'," \
+#define MPRIS_IFACE   "org.mpris.MediaPlayer2.Player"
+#define MPRIS_PATH    "/org/mpris/MediaPlayer2"
+#define DBUS_PROPS    "org.freedesktop.DBus.Properties"
+#define MPRIS_NOTRACK "/org/mpris/MediaPlayer2/TrackList/NoTrack"
+#define MPRIS_MATCH_PROPS \
+    "type='signal',interface='" DBUS_PROPS "'," \
     "member='PropertiesChanged',path='" MPRIS_PATH "',arg0='" MPRIS_IFACE "'"
+#define MPRIS_MATCH_SEEKED \
+    "type='signal',interface='" MPRIS_IFACE "',member='Seeked',path='" MPRIS_PATH "'"
+
+/* thr_mpris-local state */
+typedef struct {
+    DBusConnection *c;
+    char            active[256]; /* unique bus name of the active player */
+} mpris_t;
 
 static bool dbus_iter_get_string(DBusMessageIter *it, char *out, size_t sz) {
     int t = dbus_message_iter_get_arg_type(it);
@@ -783,16 +871,30 @@ static bool dbus_iter_get_string(DBusMessageIter *it, char *out, size_t sz) {
     return false;
 }
 
+/* mpris:length / Position are specified as int64 (µs), but players
+ * also send uint64, int32 or double.                                 */
+static bool dbus_iter_get_int64(DBusMessageIter *it, int64_t *out) {
+    switch (dbus_message_iter_get_arg_type(it)) {
+    case DBUS_TYPE_INT64:  { dbus_int64_t v;  dbus_message_iter_get_basic(it,&v); *out=(int64_t)v; return true; }
+    case DBUS_TYPE_UINT64: { dbus_uint64_t v; dbus_message_iter_get_basic(it,&v); *out=(int64_t)v; return true; }
+    case DBUS_TYPE_INT32:  { dbus_int32_t v;  dbus_message_iter_get_basic(it,&v); *out=v; return true; }
+    case DBUS_TYPE_UINT32: { dbus_uint32_t v; dbus_message_iter_get_basic(it,&v); *out=v; return true; }
+    case DBUS_TYPE_DOUBLE: { double v;        dbus_message_iter_get_basic(it,&v); *out=(int64_t)v; return true; }
+    }
+    return false;
+}
+
 /* new_player: the update comes from a different player than the last
- * one, so album/artwork it doesn't provide must be cleared as well.  */
+ * one, so album/artwork/length it doesn't provide must be cleared.   */
 static void mpris_process_metadata(struct data *d, DBusMessageIter *dict, bool new_player) {
     char title[256]   = "";
     char artist[256]  = "";
     char album[256]   = "";
     char artwork[512] = "";
     char trackid[256] = "";
+    int64_t length_us = 0;
     bool has_title = false, has_artist = false, has_album = false,
-         has_artwork = false, has_trackid = false;
+         has_artwork = false, has_trackid = false, has_length = false;
 
     while (dbus_message_iter_get_arg_type(dict) == DBUS_TYPE_DICT_ENTRY) {
         DBusMessageIter entry, var;
@@ -807,6 +909,7 @@ static void mpris_process_metadata(struct data *d, DBusMessageIter *dict, bool n
         else if (key && strcmp(key,"xesam:album")==0)   has_album   = dbus_iter_get_string(&var,album,  sizeof(album));
         else if (key && strcmp(key,"mpris:artUrl")==0)  has_artwork = dbus_iter_get_string(&var,artwork,sizeof(artwork));
         else if (key && strcmp(key,"mpris:trackid")==0) has_trackid = dbus_iter_get_string(&var,trackid,sizeof(trackid));
+        else if (key && strcmp(key,"mpris:length")==0)  has_length  = dbus_iter_get_int64(&var,&length_us);
 next_key:
         dbus_message_iter_next(dict);
     }
@@ -816,19 +919,26 @@ next_key:
     if (has_artist  && artist[0]  == '\0') has_artist  = false;
     if (has_album   && album[0]   == '\0') has_album   = false;
     if (has_artwork && artwork[0] == '\0') has_artwork = false;
+    if (has_length  && length_us  <= 0)    has_length  = false;
 
     bool changed = false;
     pthread_mutex_lock(&d->meta.lock);
 
     /* mpris:trackid changes whenever the player switches to a different
      * track/stream. Used to clear album/artwork that don't apply to the
-     * new track when the new update doesn't provide its own.           */
+     * new track when the new update doesn't provide its own. Some players
+     * keep one trackid for everything (Firefox), so a changed title also
+     * counts as a new track.                                           */
     bool track_changed = new_player ||
-        (has_trackid && strcmp(d->meta.last_trackid, trackid) != 0);
+        (has_trackid && strcmp(d->meta.last_trackid, trackid) != 0) ||
+        (has_title && !d->meta.title_placeholder && strcmp(d->meta.title, title) != 0);
     if (has_trackid)
         snprintf(d->meta.last_trackid, sizeof(d->meta.last_trackid), "%s", trackid);
     else if (new_player)
         d->meta.last_trackid[0] = '\0';
+
+    /* A new track starts at 0 unless a Position update says otherwise */
+    if (track_changed) meta_set_pos_locked(&d->meta, 0, now_ms());
 
     if (has_title && (d->meta.title_placeholder || strcmp(d->meta.title, title) != 0)) {
         snprintf(d->meta.title, sizeof(d->meta.title), "%s", title);
@@ -851,39 +961,189 @@ next_key:
         d->meta.artwork[0] = '\0'; changed=true;
     }
 
+    /* Metadata is always the complete map (MPRIS spec), so an update
+     * without mpris:length means the length is unknown – e.g. the next
+     * video is a livestream while trackid and title stay the same.     */
+    int64_t dur_ms = has_length ? length_us / 1000 : 0;
+    if (d->meta.dur_ms != dur_ms)
+        { d->meta.dur_ms = dur_ms; changed=true; }
+
     if (changed)
-        pw_log_info("MPRIS meta: title='%s' artist='%s'", d->meta.title, d->meta.artist);
+        pw_log_info("MPRIS meta: title='%s' artist='%s' duration=%" PRId64 " ms",
+                    d->meta.title, d->meta.artist, d->meta.dur_ms);
     pthread_mutex_unlock(&d->meta.lock);
 
     /* thr_meta posts it right away – but only while connected */
     if (changed) meta_mark_dirty(&d->meta);
 }
 
-/* Fetches the full Metadata property of a player that just became
- * active (its PlaybackStatus signal usually carries no Metadata).    */
-static void mpris_fetch_metadata(struct data *d, DBusConnection *c, const char *dest) {
-    DBusMessage *m = dbus_message_new_method_call(dest, MPRIS_PATH,
-        "org.freedesktop.DBus.Properties", "Get");
-    if (!m) return;
-    const char *iface = MPRIS_IFACE, *prop = "Metadata";
-    dbus_message_append_args(m, DBUS_TYPE_STRING, &iface, DBUS_TYPE_STRING, &prop, DBUS_TYPE_INVALID);
+static int mpris_parse_status(const char *s) {
+    if (strcmp(s, "Playing") == 0) return MPRIS_STATE_PLAYING;
+    if (strcmp(s, "Paused")  == 0) return MPRIS_STATE_PAUSED;
+    if (strcmp(s, "Stopped") == 0) return MPRIS_STATE_STOPPED;
+    return MPRIS_STATE_UNKNOWN;
+}
+
+/* Finds a string property in an a{sv} iterator (passed by value, so
+ * the caller's iterator is not advanced).                            */
+static bool mpris_find_string_prop(DBusMessageIter props, const char *name, char *out, size_t sz) {
+    while (dbus_message_iter_get_arg_type(&props) == DBUS_TYPE_DICT_ENTRY) {
+        DBusMessageIter entry, var;
+        dbus_message_iter_recurse(&props, &entry);
+        const char *key = NULL; dbus_message_iter_get_basic(&entry, &key);
+        dbus_message_iter_next(&entry);
+        if (key && strcmp(key, name) == 0 &&
+            dbus_message_iter_get_arg_type(&entry) == DBUS_TYPE_VARIANT) {
+            dbus_message_iter_recurse(&entry, &var);
+            return dbus_iter_get_string(&var, out, sz);
+        }
+        dbus_message_iter_next(&props);
+    }
+    return false;
+}
+
+/* Applies an a{sv} of Player properties (from PropertiesChanged or
+ * GetAll): Metadata, PlaybackStatus, Position, Rate.                 */
+static void mpris_apply_props(struct data *d, DBusMessageIter *props, bool new_player) {
+    DBusMessageIter meta_dict; bool has_meta = false, has_pos = false, has_rate = false;
+    char status[32] = "";
+    int64_t pos_us = 0; double rate = 1.0;
+
+    while (dbus_message_iter_get_arg_type(props) == DBUS_TYPE_DICT_ENTRY) {
+        DBusMessageIter entry, var;
+        dbus_message_iter_recurse(props, &entry);
+        const char *key=NULL; dbus_message_iter_get_basic(&entry,&key);
+        dbus_message_iter_next(&entry);
+        if (key && dbus_message_iter_get_arg_type(&entry)==DBUS_TYPE_VARIANT) {
+            dbus_message_iter_recurse(&entry,&var);
+            if (strcmp(key,"Metadata")==0 && dbus_message_iter_get_arg_type(&var)==DBUS_TYPE_ARRAY) {
+                dbus_message_iter_recurse(&var,&meta_dict); has_meta = true;
+            } else if (strcmp(key,"PlaybackStatus")==0) {
+                dbus_iter_get_string(&var, status, sizeof(status));
+            } else if (strcmp(key,"Position")==0) {
+                has_pos = dbus_iter_get_int64(&var, &pos_us);
+            } else if (strcmp(key,"Rate")==0 && dbus_message_iter_get_arg_type(&var)==DBUS_TYPE_DOUBLE) {
+                dbus_message_iter_get_basic(&var, &rate); has_rate = rate > 0.0;
+            }
+        }
+        dbus_message_iter_next(props);
+    }
+
+    if (has_meta) mpris_process_metadata(d, &meta_dict, new_player);
+
+    bool changed = false;
+    uint64_t now = now_ms();
+    pthread_mutex_lock(&d->meta.lock);
+    if (has_pos) {
+        meta_set_pos_locked(&d->meta, pos_us / 1000, now);
+        changed = true;
+    }
+    /* Rate or state changes: rebase the extrapolated position first */
+    if (has_rate && rate != d->meta.rate) {
+        meta_set_pos_locked(&d->meta, meta_pos_locked(&d->meta, now), now);
+        d->meta.rate = rate;
+    }
+    bool resumed = false;
+    if (status[0]) {
+        int st = mpris_parse_status(status);
+        if (st != d->meta.state) {
+            meta_set_pos_locked(&d->meta, meta_pos_locked(&d->meta, now), now);
+            d->meta.state = st;
+            resumed = st == MPRIS_STATE_PLAYING;
+            pw_log_info("MPRIS: player is %s", status);
+            changed = true;
+        }
+    }
+    pthread_mutex_unlock(&d->meta.lock);
+    /* Resuming ends the pause keep-alive, but the player's audio reaches
+     * the sink only a moment later. Restart the idle timer so the
+     * watchdog doesn't disconnect in between – a reconnect makes
+     * Music Assistant drop the AriaCast source.                       */
+    if (resumed && atomic_load(&d->want_connect)) {
+        uint32_t t = (uint32_t)now;
+        atomic_store(&d->last_audio_ms, t ? t : 1);
+    }
+    if (changed) meta_mark_dirty(&d->meta);
+}
+
+/* Forget player-provided playback state (no active player any more). */
+static void mpris_forget_player(struct data *d, mpris_t *mp) {
+    mp->active[0] = '\0';
+    pthread_mutex_lock(&d->meta.lock);
+    d->meta.state = MPRIS_STATE_UNKNOWN;
+    d->meta.rate  = 1.0;
+    d->meta.dur_ms = 0;
+    meta_set_pos_locked(&d->meta, 0, 0);
+    pthread_mutex_unlock(&d->meta.lock);
+    meta_mark_dirty(&d->meta);
+}
+
+/* Drops the active player if a call failed because it is gone. */
+static void mpris_check_gone(struct data *d, mpris_t *mp, DBusError *err) {
+    if (dbus_error_has_name(err, DBUS_ERROR_SERVICE_UNKNOWN) ||
+        dbus_error_has_name(err, DBUS_ERROR_NAME_HAS_NO_OWNER)) {
+        pw_log_info("MPRIS: player %s is gone", mp->active);
+        mpris_forget_player(d, mp);
+    }
+}
+
+/* Blocking Properties call on the active player (500 ms timeout). */
+static DBusMessage *mpris_props_call(struct data *d, mpris_t *mp, const char *method, const char *prop) {
+    DBusMessage *m = dbus_message_new_method_call(mp->active, MPRIS_PATH, DBUS_PROPS, method);
+    if (!m) return NULL;
+    const char *iface = MPRIS_IFACE;
+    if (prop) dbus_message_append_args(m, DBUS_TYPE_STRING, &iface, DBUS_TYPE_STRING, &prop, DBUS_TYPE_INVALID);
+    else      dbus_message_append_args(m, DBUS_TYPE_STRING, &iface, DBUS_TYPE_INVALID);
     DBusError err; dbus_error_init(&err);
-    DBusMessage *r = dbus_connection_send_with_reply_and_block(c, m, 500, &err);
+    DBusMessage *r = dbus_connection_send_with_reply_and_block(mp->c, m, 500, &err);
     dbus_message_unref(m);
-    if (!r) { pw_log_debug("MPRIS: Get(Metadata) from %s failed: %s", dest, err.message); dbus_error_free(&err); return; }
-    DBusMessageIter it, var, dict;
+    if (!r) {
+        pw_log_debug("MPRIS: %s(%s) on %s failed: %s", method, prop ? prop : "",
+                     mp->active, err.message ? err.message : "?");
+        mpris_check_gone(d, mp, &err);
+        dbus_error_free(&err);
+    }
+    return r;
+}
+
+/* Reads the full state of a player that just became active. Returns
+ * false if the call failed.                                          */
+static bool mpris_get_all(struct data *d, mpris_t *mp) {
+    DBusMessage *r = mpris_props_call(d, mp, "GetAll", NULL);
+    if (!r) return false;
+    DBusMessageIter it, dict;
+    if (dbus_message_iter_init(r, &it) && dbus_message_iter_get_arg_type(&it) == DBUS_TYPE_ARRAY) {
+        dbus_message_iter_recurse(&it, &dict);
+        mpris_apply_props(d, &dict, true);
+    }
+    dbus_message_unref(r);
+    return true;
+}
+
+/* Players don't signal Position changes; re-read it periodically to
+ * correct drift of the extrapolated value.                           */
+static void mpris_poll_position(struct data *d, mpris_t *mp) {
+    if (!mp->active[0]) return;
+    pthread_mutex_lock(&d->meta.lock);
+    bool playing = d->meta.state == MPRIS_STATE_PLAYING;
+    pthread_mutex_unlock(&d->meta.lock);
+    if (!playing) return;
+
+    DBusMessage *r = mpris_props_call(d, mp, "Get", "Position");
+    if (!r) return;
+    DBusMessageIter it, var; int64_t pos_us;
     if (dbus_message_iter_init(r, &it) && dbus_message_iter_get_arg_type(&it) == DBUS_TYPE_VARIANT) {
         dbus_message_iter_recurse(&it, &var);
-        if (dbus_message_iter_get_arg_type(&var) == DBUS_TYPE_ARRAY) {
-            dbus_message_iter_recurse(&var, &dict);
-            mpris_process_metadata(d, &dict, true);
+        if (dbus_iter_get_int64(&var, &pos_us)) {
+            pthread_mutex_lock(&d->meta.lock);
+            meta_set_pos_locked(&d->meta, pos_us / 1000, now_ms());
+            pthread_mutex_unlock(&d->meta.lock);
         }
     }
     dbus_message_unref(r);
 }
 
-static void mpris_handle_props_changed(struct data *d, DBusConnection *c,
-                                       DBusMessage *msg, char *active, size_t asz) {
+static void mpris_handle_props_changed(struct data *d, mpris_t *mp, DBusMessage *msg) {
     const char *sender = dbus_message_get_sender(msg);
     if (!sender) return;
 
@@ -900,36 +1160,123 @@ static void mpris_handle_props_changed(struct data *d, DBusConnection *c,
     /* arg 1: a{sv} changed properties */
     if (dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_ARRAY)
         return;
-    DBusMessageIter outer_dict; dbus_message_iter_recurse(&iter, &outer_dict);
+    DBusMessageIter props; dbus_message_iter_recurse(&iter, &props);
 
-    DBusMessageIter meta_dict; bool has_meta = false;
     char status[32] = "";
-    while (dbus_message_iter_get_arg_type(&outer_dict) == DBUS_TYPE_DICT_ENTRY) {
-        DBusMessageIter entry, var;
-        dbus_message_iter_recurse(&outer_dict, &entry);
-        const char *key=NULL; dbus_message_iter_get_basic(&entry,&key);
-        dbus_message_iter_next(&entry);
-        if (key && dbus_message_iter_get_arg_type(&entry)==DBUS_TYPE_VARIANT) {
-            dbus_message_iter_recurse(&entry,&var);
-            if (strcmp(key,"Metadata")==0 && dbus_message_iter_get_arg_type(&var)==DBUS_TYPE_ARRAY) {
-                dbus_message_iter_recurse(&var,&meta_dict); has_meta = true;
-            } else if (strcmp(key,"PlaybackStatus")==0) {
-                dbus_iter_get_string(&var, status, sizeof(status));
-            }
-        }
-        dbus_message_iter_next(&outer_dict);
-    }
+    mpris_find_string_prop(props, "PlaybackStatus", status, sizeof(status));
 
     bool new_player = false;
-    if (strcmp(active, sender) != 0 && (!active[0] || strcmp(status, "Playing") == 0)) {
+    if (strcmp(mp->active, sender) != 0 && (!mp->active[0] || strcmp(status, "Playing") == 0)) {
         pw_log_info("MPRIS: following player %s", sender);
-        snprintf(active, asz, "%s", sender);
+        snprintf(mp->active, sizeof(mp->active), "%s", sender);
         new_player = true;
     }
-    if (strcmp(active, sender) != 0) return; /* not the active player */
+    if (strcmp(mp->active, sender) != 0) return; /* not the active player */
 
-    if (has_meta)        mpris_process_metadata(d, &meta_dict, new_player);
-    else if (new_player) mpris_fetch_metadata(d, c, sender);
+    /* A new player's signal usually carries only what changed – read
+     * its full state instead; fall back to the signal on failure.    */
+    if (!new_player || !mpris_get_all(d, mp))
+        mpris_apply_props(d, &props, new_player);
+}
+
+static void mpris_handle_seeked(struct data *d, mpris_t *mp, DBusMessage *msg) {
+    const char *sender = dbus_message_get_sender(msg);
+    if (!sender || strcmp(sender, mp->active) != 0) return;
+    dbus_int64_t pos_us;
+    if (!dbus_message_get_args(msg, NULL, DBUS_TYPE_INT64, &pos_us, DBUS_TYPE_INVALID)) return;
+    pthread_mutex_lock(&d->meta.lock);
+    meta_set_pos_locked(&d->meta, pos_us / 1000, now_ms());
+    pthread_mutex_unlock(&d->meta.lock);
+    meta_mark_dirty(&d->meta);
+}
+
+/* ── /control → MPRIS ─────────────────────────────────────────────── */
+
+/* Called from thr_ctrl. Drops the command if the queue is full. */
+static void mpris_queue_cmd(struct data *d, const char *action, int64_t pos_ms) {
+    bool queued = false;
+    pthread_mutex_lock(&d->cmd_lock);
+    if (d->n_cmds < MPRIS_CMD_MAX) {
+        snprintf(d->cmds[d->n_cmds].action, sizeof(d->cmds[0].action), "%s", action);
+        d->cmds[d->n_cmds].pos_ms = pos_ms;
+        d->n_cmds++; queued = true;
+    }
+    pthread_mutex_unlock(&d->cmd_lock);
+    if (!queued) { pw_log_warn("/control: command queue full, '%s' dropped", action); return; }
+    uint64_t one = 1; ssize_t r = write(d->cmd_fd, &one, sizeof(one)); (void)r;
+}
+
+/* Fire-and-forget method call on the active player. */
+static void mpris_send(mpris_t *mp, const char *method, int first_type, ...) {
+    DBusMessage *m = dbus_message_new_method_call(mp->active, MPRIS_PATH, MPRIS_IFACE, method);
+    if (!m) return;
+    va_list ap; va_start(ap, first_type);
+    bool ok = dbus_message_append_args_valist(m, first_type, ap);
+    va_end(ap);
+    dbus_message_set_no_reply(m, TRUE);
+    if (ok && dbus_connection_send(mp->c, m, NULL))
+        pw_log_info("/control: %s -> %s", method, mp->active);
+    dbus_message_unref(m);
+}
+
+static void mpris_exec_cmd(struct data *d, mpris_t *mp, const char *action, int64_t pos_ms) {
+    static const struct { const char *action, *method; } map[] = {
+        { "play",       "Play"      },
+        { "pause",      "Pause"     },
+        { "toggle",     "PlayPause" },
+        { "play_pause", "PlayPause" },
+        { "stop",       "Stop"      },
+        { "next",       "Next"      },
+        { "previous",   "Previous"  },
+    };
+    if (!mp->active[0]) {
+        pw_log_info("/control: '%s' ignored – no MPRIS player", action);
+        return;
+    }
+    if (strcmp(action, "seek") == 0) {
+        char trackid[256];
+        uint64_t now = now_ms();
+        pthread_mutex_lock(&d->meta.lock);
+        snprintf(trackid, sizeof(trackid), "%s", d->meta.last_trackid);
+        int64_t cur = meta_pos_locked(&d->meta, now);
+        if (d->meta.dur_ms > 0 && pos_ms > d->meta.dur_ms) pos_ms = d->meta.dur_ms;
+        pthread_mutex_unlock(&d->meta.lock);
+
+        dbus_int64_t us = (dbus_int64_t)pos_ms * 1000;
+        if (trackid[0] && strcmp(trackid, MPRIS_NOTRACK) != 0 && dbus_validate_path(trackid, NULL)) {
+            const char *tp = trackid;
+            mpris_send(mp, "SetPosition", DBUS_TYPE_OBJECT_PATH, &tp, DBUS_TYPE_INT64, &us, DBUS_TYPE_INVALID);
+        } else {
+            /* No usable track id: relative Seek from the estimated position */
+            dbus_int64_t off = (dbus_int64_t)(pos_ms - cur) * 1000;
+            mpris_send(mp, "Seek", DBUS_TYPE_INT64, &off, DBUS_TYPE_INVALID);
+        }
+        /* Optimistic; the player's Seeked signal confirms or corrects */
+        pthread_mutex_lock(&d->meta.lock);
+        meta_set_pos_locked(&d->meta, pos_ms, now);
+        pthread_mutex_unlock(&d->meta.lock);
+        meta_mark_dirty(&d->meta);
+        return;
+    }
+    for (size_t i = 0; i < SPA_N_ELEMENTS(map); i++) {
+        if (strcmp(action, map[i].action) == 0) {
+            mpris_send(mp, map[i].method, DBUS_TYPE_INVALID);
+            return;
+        }
+    }
+    pw_log_debug("/control: unknown action '%s' ignored", action);
+}
+
+static void mpris_run_cmds(struct data *d, mpris_t *mp) {
+    uint64_t v; ssize_t r = read(d->cmd_fd, &v, sizeof(v)); (void)r; /* reset eventfd */
+    struct { char action[16]; int64_t pos_ms; } cmds[MPRIS_CMD_MAX];
+    pthread_mutex_lock(&d->cmd_lock);
+    int n = d->n_cmds;
+    memcpy(cmds, d->cmds, sizeof(cmds[0]) * (size_t)n);
+    d->n_cmds = 0;
+    pthread_mutex_unlock(&d->cmd_lock);
+    for (int i = 0; i < n; i++) mpris_exec_cmd(d, mp, cmds[i].action, cmds[i].pos_ms);
+    if (n > 0) dbus_connection_flush(mp->c);
 }
 
 /* ── MPRIS thread ─────────────────────────────────────────────────── */
@@ -946,7 +1293,8 @@ static DBusConnection *mpris_open(void) {
     }
     /* libdbus defaults to _exit() on disconnect – fatal for the daemon */
     dbus_connection_set_exit_on_disconnect(c, FALSE);
-    dbus_bus_add_match(c, MPRIS_MATCH, &err);
+    dbus_bus_add_match(c, MPRIS_MATCH_PROPS, &err);
+    if (!dbus_error_is_set(&err)) dbus_bus_add_match(c, MPRIS_MATCH_SEEKED, &err);
     if (dbus_error_is_set(&err)) {
         pw_log_warn("MPRIS: add_match failed: %s", err.message);
         dbus_error_free(&err);
@@ -959,26 +1307,52 @@ static DBusConnection *mpris_open(void) {
 
 static void *thr_mpris_fn(void *arg) {
     struct data *d = arg;
-    char active[256];
+    mpris_t mp = {0};
 
     while (is_running(d)) {
-        DBusConnection *c = mpris_open();
-        if (!c) { isleep_ms(d->wake_r, 2000); continue; }
+        mp.c = mpris_open();
+        if (!mp.c) { isleep_ms(d->wake_r, 2000); continue; }
         pw_log_info("MPRIS2 listener started");
-        active[0] = '\0';
+        mpris_forget_player(d, &mp);
 
-        while (is_running(d) && dbus_connection_get_is_connected(c)) {
-            dbus_connection_read_write(c, 300);
+        int dfd = -1;
+        if (!dbus_connection_get_unix_fd(mp.c, &dfd)) dfd = -1;
+        uint64_t next_poll = now_ms() + MPRIS_POS_POLL_MS;
+
+        while (is_running(d) && dbus_connection_get_is_connected(mp.c)) {
+            dbus_connection_read_write(mp.c, 0);
             DBusMessage *msg;
-            while ((msg=dbus_connection_pop_message(c))!=NULL) {
-                if (dbus_message_is_signal(msg,"org.freedesktop.DBus.Properties","PropertiesChanged"))
-                    mpris_handle_props_changed(d, c, msg, active, sizeof(active));
+            while ((msg=dbus_connection_pop_message(mp.c))!=NULL) {
+                if (dbus_message_is_signal(msg,DBUS_PROPS,"PropertiesChanged"))
+                    mpris_handle_props_changed(d, &mp, msg);
+                else if (dbus_message_is_signal(msg,MPRIS_IFACE,"Seeked"))
+                    mpris_handle_seeked(d, &mp, msg);
                 dbus_message_unref(msg);
             }
+            mpris_run_cmds(d, &mp);
+
+            uint64_t now = now_ms();
+            if (now >= next_poll) {
+                mpris_poll_position(d, &mp);
+                next_poll = now + MPRIS_POS_POLL_MS;
+            }
+            /* Blocking calls above may have queued further messages */
+            if (dbus_connection_get_dispatch_status(mp.c) == DBUS_DISPATCH_DATA_REMAINS)
+                continue;
+
+            long to = next_poll > now ? (long)(next_poll - now) : 0;
+            if (dfd < 0 && to > 100) to = 100;
+            struct pollfd pf[3] = {
+                { .fd = dfd,       .events = POLLIN },
+                { .fd = d->cmd_fd, .events = POLLIN },
+                { .fd = d->wake_r, .events = POLLIN },
+            };
+            poll(pf, 3, (int)to);
         }
 
-        dbus_connection_close(c);
-        dbus_connection_unref(c);
+        dbus_connection_close(mp.c);
+        dbus_connection_unref(mp.c);
+        mp.c = NULL;
         if (is_running(d)) {
             pw_log_warn("MPRIS: DBus connection lost – reconnecting");
             isleep_ms(d->wake_r, 1000);
@@ -1022,7 +1396,10 @@ static bool do_connect(struct data *d) {
     int sfd = stats_connect(host, port);
     if (sfd >= 0) conn_set(&d->stats_conn, sfd);
 
-    pthread_mutex_lock(&d->meta.lock); d->meta.playing = true; pthread_mutex_unlock(&d->meta.lock);
+    pthread_mutex_lock(&d->meta.lock);
+    d->meta.playing = true;
+    d->meta.playing_reported = false; /* new session: report isPlaying again */
+    pthread_mutex_unlock(&d->meta.lock);
     atomic_store(&d->connected, true);
     meta_mark_dirty(&d->meta); /* re-send metadata on (re)connect */
     pw_log_info("connected to AriaCast");
@@ -1036,7 +1413,10 @@ static void do_disconnect(struct data *d) {
     conn_close(&d->stats_conn, true);
     /* Drop any buffered frames so the next session starts clean */
     ring_flush(&d->ring);
-    pthread_mutex_lock(&d->meta.lock); d->meta.playing = false; pthread_mutex_unlock(&d->meta.lock);
+    pthread_mutex_lock(&d->meta.lock);
+    d->meta.playing = false;
+    d->meta.playing_reported = false;
+    pthread_mutex_unlock(&d->meta.lock);
     pw_log_info("disconnected from AriaCast");
 }
 
@@ -1128,13 +1508,23 @@ static void *thr_audio_fn(void *arg) {
     pw_log_info("audio sender thread stopped"); return NULL;
 }
 
-/* ── Idle watchdog: clears want_connect after AC_IDLE_MS of silence ── */
-static bool audio_idle(struct data *d) {
+/* ── Idle watchdog: clears want_connect after AC_IDLE_MS of silence ──
+ * While the active MPRIS player is paused, the connection is kept for
+ * up to pause_keepalive_ms instead, so a "play" from the receiver can
+ * still arrive on /control.                                          */
+static uint32_t idle_limit_ms(struct data *d) {
+    pthread_mutex_lock(&d->meta.lock);
+    bool paused = d->meta.state == MPRIS_STATE_PAUSED;
+    pthread_mutex_unlock(&d->meta.lock);
+    return paused && d->pause_keepalive_ms > AC_IDLE_MS ? d->pause_keepalive_ms : AC_IDLE_MS;
+}
+static bool audio_idle(struct data *d, uint32_t limit) {
     uint32_t last = atomic_load(&d->last_audio_ms);
-    return last != 0 && (uint32_t)now_ms() - last > AC_IDLE_MS;
+    return last != 0 && (uint32_t)now_ms() - last > limit;
 }
 static void *thr_watchdog_fn(void *arg) {
     struct data *d = arg;
+    bool kept_alive = false;
     while (is_running(d)) {
         isleep_ms(d->wake_r, 250);
         if (!is_running(d)) break;
@@ -1142,26 +1532,47 @@ static void *thr_watchdog_fn(void *arg) {
         unsigned dropped = atomic_exchange(&d->frames_dropped, 0);
         if (dropped) pw_log_warn("dropped %u audio frames (send buffer full)", dropped);
 
-        if (!atomic_load(&d->want_connect) || !audio_idle(d)) continue;
+        if (!atomic_load(&d->want_connect)) { kept_alive = false; continue; }
+        uint32_t limit = idle_limit_ms(d);
+        if (!audio_idle(d, limit)) {
+            if (!audio_idle(d, AC_IDLE_MS)) kept_alive = false;
+            else if (limit > AC_IDLE_MS && !kept_alive) {
+                pw_log_info("player paused – keeping connection for up to %u s",
+                            limit / 1000);
+                kept_alive = true;
+            }
+            continue;
+        }
         atomic_store(&d->want_connect, false);
         /* on_process() may have stored a fresh timestamp just before we
          * cleared the flag without seeing it change – undo in that case. */
-        if (!audio_idle(d)) { atomic_store(&d->want_connect, true); continue; }
+        if (!audio_idle(d, limit)) { atomic_store(&d->want_connect, true); continue; }
+        kept_alive = false;
         pthread_mutex_lock(&d->state_lock);
         pthread_cond_broadcast(&d->state_cond);
         pthread_mutex_unlock(&d->state_lock);
-        pw_log_info("idle for %d ms – disconnecting", AC_IDLE_MS);
+        pw_log_info("idle for %u ms – disconnecting", limit);
     }
     return NULL;
 }
 
+/* {"action":"play|pause|toggle|stop|next|previous"} or
+ * {"action":"seek","position_ms":N} – forwarded to the MPRIS player.
+ * isPlaying follows from the player's PlaybackStatus afterwards.     */
 static void handle_ctrl_action(struct data *d, const char *j) {
-    pthread_mutex_lock(&d->meta.lock);
-    if      (strstr(j,"\"play\""))   d->meta.playing = true;
-    else if (strstr(j,"\"pause\""))  d->meta.playing = false;
-    else if (strstr(j,"\"toggle\"")) d->meta.playing = !d->meta.playing;
-    else if (strstr(j,"\"stop\""))   d->meta.playing = false;
-    pthread_mutex_unlock(&d->meta.lock);
+    char action[16];
+    if (!json_get_str(j,"action",action,sizeof(action))) {
+        pw_log_debug("/control: %s", j);
+        return;
+    }
+    for (char *p = action; *p; p++) *p = (char)tolower((unsigned char)*p);
+    long pos = 0;
+    if (strcmp(action,"seek")==0 &&
+        !json_get_long(j,"position_ms",&pos) && !json_get_long(j,"value",&pos)) {
+        pw_log_warn("/control: seek without position: %s", j);
+        return;
+    }
+    mpris_queue_cmd(d, action, pos < 0 ? 0 : pos);
 }
 
 static void *thr_ctrl_fn(void *arg) {
@@ -1207,14 +1618,16 @@ static void *thr_stats_fn(void *arg) {
     return NULL;
 }
 
-/* Posts metadata every AC_META_EVERY_MS and immediately when marked
- * dirty – but only while connected.                                  */
+/* Posts metadata immediately when marked dirty, every
+ * AC_META_PLAYING_MS while playing (so the receiver's position stays
+ * current) and every AC_META_EVERY_MS otherwise – only while connected. */
 static void *thr_meta_fn(void *arg) {
     struct data *d = arg;
     while (is_running(d)) {
         pthread_mutex_lock(&d->meta.lock);
         if (!d->meta.dirty && is_running(d))
-            cond_wait_ms(&d->meta.cond, &d->meta.lock, AC_META_EVERY_MS);
+            cond_wait_ms(&d->meta.cond, &d->meta.lock,
+                         meta_is_playing_locked(&d->meta) ? AC_META_PLAYING_MS : AC_META_EVERY_MS);
         d->meta.dirty = false;
         pthread_mutex_unlock(&d->meta.lock);
         if (is_running(d) && atomic_load(&d->connected))
@@ -1534,6 +1947,8 @@ static void teardown(struct data *d) {
     d->core = NULL;
 
     close(d->wake_r); close(d->wake_w);
+    if (d->cmd_fd >= 0) close(d->cmd_fd);
+    pthread_mutex_destroy(&d->cmd_lock);
     ring_destroy(&d->ring);
     conn_destroy(&d->audio_conn);
     conn_destroy(&d->ctrl_conn);
@@ -1583,7 +1998,9 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
     pthread_mutex_init(&d->state_lock,NULL);
     pthread_mutex_init(&d->name_lock,NULL);
     pthread_mutex_init(&d->srv_lock,NULL);
+    pthread_mutex_init(&d->cmd_lock,NULL);
     pthread_cond_init(&d->state_cond,NULL);
+    d->cmd_fd = -1;
     ring_init(&d->ring);
     meta_init(&d->meta);
     conn_init(&d->audio_conn);
@@ -1596,6 +2013,7 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
     snprintf(d->sink_desc,sizeof(d->sink_desc),"AriaCast Sink");
     d->port      = AC_STREAM_PORT;
     d->discovery = true;
+    d->pause_keepalive_ms = AC_PAUSE_KEEPALIVE_S * 1000;
 
     struct pw_properties *props = args
         ? pw_properties_new_string(args)
@@ -1608,18 +2026,28 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
         if((v=pw_properties_get(props,KEY_NAME)))     { snprintf(d->sink_name,sizeof(d->sink_name),"%s",v); d->name_user_set=true; }
         if((v=pw_properties_get(props,KEY_DESC)))     { snprintf(d->sink_desc,sizeof(d->sink_desc),"%s",v); d->desc_user_set=true; }
         if((v=pw_properties_get(props,KEY_DISCOVERY)))d->discovery=strcmp(v,"false")!=0&&strcmp(v,"0")!=0;
+        if((v=pw_properties_get(props,KEY_KEEPALIVE))) {
+            char *e; errno=0; long s=strtol(v,&e,10);
+            if (errno || e==v || *e || s<0 || s>86400)
+                pw_log_warn("invalid %s \"%s\" – using %u", KEY_KEEPALIVE, v, AC_PAUSE_KEEPALIVE_S);
+            else
+                d->pause_keepalive_ms=(uint32_t)s*1000;
+        }
         pw_properties_free(props);
     }
 
-    pw_log_info("server=%s:%u discovery=%s sink=\"%s\" description=\"%s\"",
+    pw_log_info("server=%s:%u discovery=%s sink=\"%s\" description=\"%s\" pause-keepalive=%us",
                 d->host,d->port,d->discovery?"yes":"no",
-                d->sink_name,d->sink_desc);
+                d->sink_name,d->sink_desc,d->pause_keepalive_ms/1000);
 
     snprintf(d->meta.title, sizeof(d->meta.title), "%s", d->sink_name);
     snprintf(d->meta.artist,sizeof(d->meta.artist),"PipeWire");
     d->meta.title_placeholder = true;
 
     int res;
+    d->cmd_fd = eventfd(0, EFD_CLOEXEC|EFD_NONBLOCK);
+    if (d->cmd_fd < 0) { res=-errno; pw_log_error("eventfd failed: %s", spa_strerror(res)); goto fail; }
+
     d->sink_event = pw_loop_add_event(d->loop, on_sink_event, d);
     if (!d->sink_event) { res=-errno; pw_log_error("pw_loop_add_event failed: %s", spa_strerror(res)); goto fail; }
 

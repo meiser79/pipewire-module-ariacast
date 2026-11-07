@@ -208,11 +208,13 @@ pw-cli load-module libpipewire-module-ariacast \
 | `/audio`: READY handshake, 3 s timeout | `audio_connect()` |
 | `/audio`: reconnect on send failure | `thr_audio_fn()` retry |
 | `/control`: receive `action`-keyed commands | `thr_ctrl_fn()` + `handle_ctrl_action()` |
+| `/control`: forward commands to the active MPRIS player | `mpris_exec_cmd()` |
 | `/control`: optional Python server handshake | `ctrl_connect()` (1 s timeout) |
 | `/stats`: receive server push | `thr_stats_fn()` |
 | Metadata: `HTTP POST /metadata` with `{"data":{…}}` | `http_post_meta()` |
 | Metadata: both camelCase + snake_case keys | `meta_to_json()` |
-| Metadata: refresh every 10 s, immediately on change | `thr_meta_fn()` |
+| Metadata: refresh every 10 s (every 1 s while playing), immediately on change | `thr_meta_fn()` |
+| Metadata: `positionMs` = last position + elapsed × rate | `meta_pos_locked()` |
 | Metadata: re-send on reconnect | `do_connect()` |
 | Metadata: JSON string escaping | `json_escape()` / `meta_to_json()` |
 | Reconnect backoff: `1000 × 2^min(attempt, 5)` ms | `isleep_ms()` inline |
@@ -237,6 +239,27 @@ reads standard MPRIS2 keys from the `Metadata` property:
 | `xesam:artist` | `artist` (first element if an array) |
 | `xesam:album`  | `album` |
 | `mpris:artUrl` | `artworkUrl` |
+| `mpris:length` | `durationMs` (µs → ms) |
+
+and these player properties:
+
+| MPRIS2 property | AriaCast field |
+|---|---|
+| `PlaybackStatus` | `isPlaying` (`false` when `Paused`/`Stopped`) |
+| `Position`, `Rate` | `positionMs` |
+
+`isPlaying` is sent only when it changes (and once after each connect), not
+with every periodic update. Receivers act on it: Music Assistant starts
+playback when a sender reports `true` and drops the AriaCast source when it
+reports `false`. Repeating a stale `true` while the receiver is pausing would
+make it restart playback and then lose the source, so play from the receiver
+would no longer reach the sender.
+
+MPRIS players don't signal position changes, so the module estimates the
+position between updates (last known position + elapsed time × `Rate`) and
+corrects it from `Seeked` signals and by re-reading `Position` every 5 s
+while playing. While playing, metadata is posted every second so the
+receiver's progress display stays current.
 
 Only signals for the `org.mpris.MediaPlayer2.Player` interface are used, and
 only from the *active* player: the one that most recently reported
@@ -253,10 +276,40 @@ change, and every 10 s).
 Empty-string values are treated as "not present", since some players send
 empty strings for fields they have cleared rather than omitting them.
 
-`mpris:trackid` is used only to detect track changes: when the track ID
-changes and the new `Metadata` update has no `xesam:album` / `mpris:artUrl`,
-the previous track's album/artwork are cleared so stale cover art isn't
-shown for the new track.
+A new track is detected when `mpris:trackid` or `xesam:title` changes; the
+title covers players that reuse one track ID for all media. On a new track,
+the position restarts at 0, and album and artwork are cleared unless the
+update provides new ones, so stale cover art isn't shown. The track ID is
+also the target for seeks.
+
+`Metadata` always carries the player's complete set of fields, so an update
+without `mpris:length` (e.g. a livestream) clears the duration.
+
+### Playback control from the receiver
+
+`/control` commands from the AriaCast receiver are forwarded to the active
+MPRIS player (`action` is matched case-insensitively):
+
+| `/control` message | MPRIS2 call |
+|---|---|
+| `{"action":"play"}` | `Play` |
+| `{"action":"pause"}` | `Pause` |
+| `{"action":"toggle"}` | `PlayPause` |
+| `{"action":"stop"}` | `Stop` |
+| `{"action":"next"}` | `Next` |
+| `{"action":"previous"}` | `Previous` |
+| `{"action":"seek","position_ms":N}` | `SetPosition(trackid, N)`, or a relative `Seek` if the player has no usable track ID |
+
+`isPlaying` is not toggled by the command itself; it follows the player's
+`PlaybackStatus` once the player has reacted. Without an active MPRIS player,
+commands are logged and ignored.
+
+Normally the module disconnects from the receiver after 3 s of silence.
+While the active MPRIS player is `Paused`, it stays connected instead, so a
+later `play` from the receiver still reaches the player. This keep-alive
+ends after `ariacast.pause.keepalive` seconds of silence (default `600`;
+`0` disables it), or as soon as the player is no longer paused (stopped,
+closed) and the sink is silent.
 
 Works with any MPRIS2-compatible player: VLC, Spotify, Rhythmbox,
 Clementine, Firefox ≥ 85, Chromium. Internet radio stations that only expose
@@ -278,7 +331,8 @@ PipeWire daemon
     │     on_state_changed()  ──► UNCONNECTED/ERROR ──► want_connect=false
     │
     ├── thr_watchdog   every 250 ms: clears want_connect after AC_IDLE_MS
-    │                  of silence (no audio in on_process)
+    │                  of silence (no audio in on_process), or after
+    │                  ariacast.pause.keepalive while the player is paused
     │
     ├── thr_connmgr   runs UDP discovery once (if no host configured),
     │     │               then signals the main loop to create the sink
@@ -295,10 +349,13 @@ PipeWire daemon
     │
     ├── thr_audio   ring_pop() → ws_send_frame(/audio, BINARY, 3840 B)
     ├── thr_ctrl    ws_recv_frame(/control) → handle_ctrl_action()
+    │               → command queue → thr_mpris → MPRIS method call
     ├── thr_stats   ws_recv_frame(/stats)   → pw_log_debug()
-    ├── thr_meta    HTTP POST /metadata every 10 s + on change (while connected)
+    ├── thr_meta    HTTP POST /metadata every 10 s (1 s while playing)
+    │               + on change (while connected)
     └── thr_mpris   private DBus session connection → MPRIS2
-                    PropertiesChanged (active player) → meta update
+                    PropertiesChanged/Seeked (active player) → meta update,
+                    executes queued /control commands
 ```
 
 ### Threading and shutdown
@@ -331,8 +388,10 @@ objects itself.
 
 - No TLS (`wss://`) — spec security model targets trusted LAN only.
   Frames from the server are limited to 64 KiB.
-- `seek` commands from `/control` are received and logged but not forwarded
-  to PipeWire (would require MediaSession integration)
+- The connection to the receiver (including `/control`) exists only while
+  audio is flowing, or while the active MPRIS player is paused (up to
+  `ariacast.pause.keepalive`, default 10 min). After that, a `play` from the
+  receiver can't reach the module — resume on the computer instead.
 - `/stats` data is logged via `pw_log_debug` but not exposed as PipeWire
   node properties
 
