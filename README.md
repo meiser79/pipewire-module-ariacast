@@ -46,7 +46,8 @@ sudo dnf install pipewire-devel dbus-devel meson ninja-build gcc pkgconfig
 meson setup build
 ninja -C build
 
-# Install .so to PipeWire module dir + .conf to /etc/pipewire/pipewire.conf.d/
+# Install .so to the PipeWire module dir; the config snippet is installed
+# as an example to <prefix>/share/doc/pipewire-module-ariacast/
 sudo ninja -C build install
 ```
 
@@ -79,6 +80,11 @@ UDP port 12888 at startup (5 attempts, 3 s apart) and connects to the first
 server that responds.  This happens in a background thread and never blocks
 the PipeWire daemon.
 
+The sink is created once this initial discovery has finished (immediately
+after the first response, or after the last attempt if no server answers),
+so that its `node.name` is derived from the discovered device from the
+start.
+
 ### Sink naming from the discovered server (default)
 
 The discovery response contains a `server_name` field. When discovery is
@@ -87,7 +93,7 @@ No sink name or description needs to be configured.
 
 For example:
 
-| Discovered `server_name` | `node.name` | Description / `node.nick` |
+| Discovered `server_name` | `node.name` | `node.description` / `node.nick` |
 |---|---|---|
 | `Living Room` | `ariacast-living-room` | `Living Room [AriaCast]` |
 | `Küche (Echo)` | `ariacast-k-che-echo` | `Küche (Echo) [AriaCast]` |
@@ -96,6 +102,11 @@ The generated sink name is a lowercase slug with non-alphanumeric characters
 collapsed to `-`, prefixed with `ariacast-`. The description keeps the device
 name unchanged and appends `[AriaCast]` so the protocol is immediately visible
 in audio-device lists.
+
+If a later re-discovery finds a server with a different name, only the
+description/nick are updated. `node.name` stays fixed while the sink exists,
+because session managers such as WirePlumber store default-sink and routing
+choices by `node.name`.
 
 `ariacast.sink.name` and `ariacast.sink.description` are optional manual
 overrides. They can be configured independently; a configured value is kept
@@ -190,9 +201,10 @@ pw-cli load-module libpipewire-module-ariacast \
 |---|---|
 | Discovery: `DISCOVER_AUDIOCAST` UDP broadcast | `discover()` |
 | Discovery: 5 attempts, 3 s delay, ephemeral socket | `discover()`, called at startup + on retries by `thr_connmgr_fn()` |
-| Discovery: `server_name` used for sink naming | `apply_server_name()` / `slugify()` |
+| Discovery: `server_name` used for sink naming | `apply_server_name()` / `slugify()` / `create_stream()` |
 | Discovery: sink description gets `[AriaCast]` suffix | `apply_server_name()` |
 | `/audio`: binary WS frames, 3840 bytes | `thr_audio_fn()` + `ring_t` |
+| WebSocket upgrade incl. `Sec-WebSocket-Accept` check | `ws_connect()` |
 | `/audio`: READY handshake, 3 s timeout | `audio_connect()` |
 | `/audio`: reconnect on send failure | `thr_audio_fn()` retry |
 | `/control`: receive `action`-keyed commands | `thr_ctrl_fn()` + `handle_ctrl_action()` |
@@ -200,14 +212,15 @@ pw-cli load-module libpipewire-module-ariacast \
 | `/stats`: receive server push | `thr_stats_fn()` |
 | Metadata: `HTTP POST /metadata` with `{"data":{…}}` | `http_post_meta()` |
 | Metadata: both camelCase + snake_case keys | `meta_to_json()` |
-| Metadata: refresh every 10 s | `thr_meta_fn()` |
+| Metadata: refresh every 10 s, immediately on change | `thr_meta_fn()` |
 | Metadata: re-send on reconnect | `do_connect()` |
+| Metadata: JSON string escaping | `json_escape()` / `meta_to_json()` |
 | Reconnect backoff: `1000 × 2^min(attempt, 5)` ms | `isleep_ms()` inline |
 
 ### Audio format
 
 The stream's `EnumFormat` announces a single fixed format -
-S16LE, 2 channels, 48000 Hz - so PipeWire's `audioconvert` filter handles
+S16LE, 2 channels (FL, FR), 48000 Hz - so PipeWire's `audioconvert` filter handles
 any sample-rate conversion and channel mapping upstream of this module.
 `on_process()` always receives audio already in this format; it only
 splits the buffer into 3840-byte (20 ms) AriaCast frames.
@@ -224,6 +237,18 @@ reads standard MPRIS2 keys from the `Metadata` property:
 | `xesam:artist` | `artist` (first element if an array) |
 | `xesam:album`  | `album` |
 | `mpris:artUrl` | `artworkUrl` |
+
+Only signals for the `org.mpris.MediaPlayer2.Player` interface are used, and
+only from the *active* player: the one that most recently reported
+`PlaybackStatus` = `Playing` (or the first player seen, until then). When a
+player becomes active, its full `Metadata` is fetched once. This keeps an
+idle player (e.g. a paused browser tab) from overwriting the metadata of the
+one that is actually playing. It is a heuristic: MPRIS does not say which
+PipeWire stream a player feeds, so two players playing at the same time
+still compete.
+
+Metadata is posted to the server only while connected (immediately on
+change, and every 10 s).
 
 Empty-string values are treated as "not present", since some players send
 empty strings for fields they have cleared rather than omitting them.
@@ -246,16 +271,18 @@ song.
 PipeWire daemon
 └── libpipewire-module-ariacast.so
     │
-    ├── pw_stream  media.class=Audio/Sink  (RT thread)
-    │     on_process()        ──► silence detection ──► want_connect flag
-    │                          ──► push_audio() ──► ring_push()
+    ├── pw_stream  media.class=Audio/Sink  (RT thread, never blocks)
+    │     on_process()        ──► silence detection ──► want_connect (atomic)
+    │                          ──► push_audio() ──► ring_push() (try-lock,
+    │                              drops the frame if full/busy)
     │     on_state_changed()  ──► UNCONNECTED/ERROR ──► want_connect=false
     │
     ├── thr_watchdog   every 250 ms: clears want_connect after AC_IDLE_MS
     │                  of silence (no audio in on_process)
     │
-    ├── thr_connmgr   waits for want_connect=true
-    │     ├── (first connect) runs UDP discovery if no host configured
+    ├── thr_connmgr   runs UDP discovery once (if no host configured),
+    │     │               then signals the main loop to create the sink
+    │     ├── waits for want_connect=true
     │     ├── do_connect()    → /audio WS + READY handshake
     │     │                   → /control WS
     │     │                   → /stats WS (optional)
@@ -269,28 +296,41 @@ PipeWire daemon
     ├── thr_audio   ring_pop() → ws_send_frame(/audio, BINARY, 3840 B)
     ├── thr_ctrl    ws_recv_frame(/control) → handle_ctrl_action()
     ├── thr_stats   ws_recv_frame(/stats)   → pw_log_debug()
-    ├── thr_meta    HTTP POST /metadata every 10 s (while connected)
-    └── thr_mpris   DBus session bus → MPRIS2 PropertiesChanged → meta update
+    ├── thr_meta    HTTP POST /metadata every 10 s + on change (while connected)
+    └── thr_mpris   private DBus session connection → MPRIS2
+                    PropertiesChanged (active player) → meta update
 ```
 
-### Shutdown handling
+### Threading and shutdown
+
+- `on_process()` runs on PipeWire's real-time data thread. It uses only
+  atomics, `pthread_mutex_trylock()` and `memcpy()`; when the send buffer
+  is full (network stall) frames are dropped and counted, never waited for.
+- Sockets live in `conn_t`. A thread using an fd holds a reference;
+  `conn_close()` calls `shutdown()` (which wakes blocked `read()`/`send()`),
+  waits for all references to drop and only then `close()`s the fd, so an
+  fd number is never reused under a running I/O call.
+- The wake pipe is written once at shutdown and never drained, so every
+  interruptible sleep (backoff, discovery, polling) returns immediately and
+  the module unloads without waiting for timeouts.
+- Worker threads are started last in `pipewire__module_init()`; if any
+  setup step fails, `teardown()` stops everything and frees all state, so
+  nothing keeps running inside the daemon after a failed load.
 
 `pw_context_connect_self()` creates an internal client connection used for
 the `pw_stream`. During a full daemon shutdown (`pw_context_destroy()`),
 PipeWire may reclaim this connection (and the stream/proxy objects bound to
-it) *before* invoking this module's `.destroy` hook. Calling
-`pw_stream_destroy()` on such an already-reclaimed object crashes inside
-libpipewire.
-
-A `pw_proxy` listener on the core connection (`core_proxy_destroy`) detects
-this case: if the daemon has already torn the connection down, the module
-skips its own `pw_stream_destroy()`/`pw_core_disconnect()` calls. On a
-normal module unload (no full daemon stop), this listener does not fire and
-the module tears down its objects itself — no leak in that case.
+it) *before* invoking this module's `.destroy` hook. A `pw_proxy` listener
+on the core connection (`core_proxy_destroy`) detects this: it unlinks its
+own hook right away (the proxy is freed after the event) and makes
+`teardown()` skip `pw_stream_destroy()`/`pw_core_disconnect()`. On a normal
+module unload the listener does not fire and the module tears down its
+objects itself.
 
 ## Known limitations / TODO
 
-- No TLS (`wss://`) — spec security model targets trusted LAN only
+- No TLS (`wss://`) — spec security model targets trusted LAN only.
+  Frames from the server are limited to 64 KiB.
 - `seek` commands from `/control` are received and logged but not forwarded
   to PipeWire (would require MediaSession integration)
 - `/stats` data is logged via `pw_log_debug` but not exposed as PipeWire
